@@ -1,0 +1,323 @@
+#!/bin/bash 
+
+FILE_URL="$1" 
+REMOTE_SERVER="$2" 
+IDENTITY="$3" 
+
+WORKINGDIRECTORY="/opt/security/working"
+DATE=$(date +%Y%m%d)
+FILENAME="IOC-${DATE}.ioc"
+GPGFILE="IOC-${DATE}.gpg"
+REPORT_FILE="${WORKINGDIRECTORY}/iocreport.txt"
+FINDINGS_FILE="${WORKINGDIRECTORY}/findings.txt"
+VALIDATE_BIN="/opt/security/bin/validate"
+STRCHECK_BIN="/opt/security/bin/strcheck"
+BAILOUT=false
+
+declare -a IOC_VALUES
+declare -a IOC_STRINGS
+
+Timestamp() {
+    date +"%Y%m%d-%H:%M" 
+}
+
+#WORKINGDIRECTORY is set to /opt/security/working & checks if directory is writable
+CheckWritable() {
+    if [ ! -w "$WORKINGDIRECTORY" ]
+    then
+        echo Fail: $WORKINGDIRECTORY not writable
+        BAILOUT=true
+    else
+        echo Pass: $WORKINGDIRECTORY is writable
+    fi
+}
+
+
+#Download the daily IoC file from the URL specified on the command line
+DownloadIOCFile() {
+    if wget -O "$WORKINGDIRECTORY/$FILENAME" "${FILE_URL}"/"${FILENAME}" -q 
+    then 
+        echo "Pass: Downloaded"
+    else
+        echo "Fail: not downloaded"
+        BAILOUT=true
+    fi 
+}
+
+
+#Check HTTPS protocol
+CheckProtocol() {
+    if [[ "$FILE_URL" =~ ^https://  ]]
+    then 
+        echo "Pass: https link"
+    else
+        echo "Fail: not https"
+        BAILOUT=true
+    fi
+}
+
+
+DownloadGPGsignature() {
+    if wget -O "$WORKINGDIRECTORY/$GPGFILE" "${FILE_URL}"/"${GPGFILE}" -q 
+    then 
+        echo "Pass: GPG signature downloaded"
+    else
+        echo "Fail: GPG signature not downloaded"
+        BAILOUT=true
+    fi 
+}
+
+
+IntegrityCheck() {
+    if  grep -q $DATE $WORKINGDIRECTORY/$FILENAME 
+    then 
+        echo "Pass: matches todays date"
+    else
+        echo "Fail: date not found in IoC file"
+        BAILOUT=true
+    fi 
+
+    if gpg --verify "$WORKINGDIRECTORY/$GPGFILE" "$WORKINGDIRECTORY/$FILENAME" >/dev/null 2>&1 
+    then 
+        echo "Pass: GPG signature is valid"
+    else
+        echo "Fail: GPG signature validation failed"
+        BAILOUT=true
+    fi 
+
+    #Validate the integrity of the validate and strcheck  tools
+    VALIDATE_HASH=$(grep 'VALIDATE' "$WORKINGDIRECTORY/$FILENAME"  |   cut -d " " -f2)
+    STRCHECK_HASH=$(grep 'STRCHECK' "$WORKINGDIRECTORY/$FILENAME"  |   cut -d " " -f2)
+    
+    if  echo "$VALIDATE_HASH $VALIDATE_BIN"    |   sha256sum -c - >/dev/null 2>&1
+    then 
+        echo "Pass: VALIDATE hash matches"
+    else
+        echo "Fail: VALIDATE hash does not match"
+        BAILOUT=true
+
+    fi
+
+    if echo "$STRCHECK_HASH $STRCHECK_BIN"    |   sha256sum -c - >/dev/null 2>&1 
+    then 
+        echo "Pass: STRCHECK hash matches"
+    else
+        echo "Fail: STRCHECK hash does not match"
+        BAILOUT=true
+    fi
+}
+
+
+#If any above items fail the script generates an error message and bails
+BAILOUTCheck() {
+    if  [ "$BAILOUT" == "true" ]
+    then 
+        echo "Script failed integrity checks. Exiting..."
+        exit 1
+    fi 
+}
+
+
+ReadIOCs() {
+    echo "### Reading IOC hash values ###"
+    local values_index=0
+    local string_index=0
+
+    while read -r line ; do
+        #Get IOC value
+        if [[ $line == \IOC* ]]
+        then
+            IOC_VALUES[$values_index]="$(echo "$line" | tr -s '[:space:]' ' ')"
+            values_index=$((values_index + 1))
+        elif [[ $line == \STR* ]]
+        then
+            IOC_STRINGS[$string_index]="$(echo "$line" | tr -s '[:space:]' ' ')"
+            string_index=$((string_index + 1))
+        fi
+    done < "$WORKINGDIRECTORY/$FILENAME"
+}
+
+
+#Process the IoCs in IOC_VALUES and IOC_STRINGS
+IOCcheck() {
+    tmpfile="$WORKINGDIRECTORY/temp_ioc_log.txt"
+    find / -xdev -type f -exec $VALIDATE_BIN {} + 1> "$tmpfile" 2> /dev/null
+    
+    for ioc in "${IOC_VALUES[@]}" ; do
+        ioc_hash=$(echo "$ioc" | cut -d " " -f2)
+        ioc_dir=$(echo "$ioc"  | cut -d " " -f3)
+
+        if [ -d "$ioc_dir" ]
+        then
+            while read -r line ; do
+                echo "IOC $line" | tee -a "$FINDINGS_FILE"
+                
+            done < <(grep " $ioc_dir" "$tmpfile" | grep "$ioc_hash" )
+        fi
+    done
+    
+    for str in  "${IOC_STRINGS[@]}"; do
+        ioc_string=$(echo "$str"   |   cut -d " " -f2)
+        ioc_dir=$(echo "$str"  |   cut -d " " -f3)
+
+        while read -r line ; do
+            echo "IOC $(sha256sum $line)" | tee -a "$FINDINGS_FILE"
+                
+        done < <( "$STRCHECK_BIN" -r -l "$ioc_string" "$ioc_dir" 2> /dev/null)
+    done   
+}
+
+
+SystemChecks() {
+    #Collect and check listening ports
+    echo "Collecting listening ports to $WORKINGDIRECTORY/listeningports"
+    echo "Currently listening ports:" > "$WORKINGDIRECTORY/listeningports"
+    ss -tuln >> "$WORKINGDIRECTORY/listeningports"
+    
+    #Collect and check Firewall Rules done
+    echo "Collecting firewall rules to $WORKINGDIRECTORY/firewall"
+    echo "Current Firewall Rules:" > "$WORKINGDIRECTORY/firewall" 
+    sudo iptables -L -n >> "$WORKINGDIRECTORY/firewall"
+
+    #Validate /sbin and /usr/sbin files
+    echo "Binary File Integrity Check Failures:" > "$WORKINGDIRECTORY/binfailure"
+    echo "Validating files in /sbin and /usr/sbin match hashes & correcting"
+
+    #Report files in /var/www that have been created in the last 48 hours, and list any SUID/GUID files (regardless of modification time)
+    for pkg in $(dpkg -S /sbin /usr/sbin | cut -d: -f1 | sed "s/,/ /g" | sort -u); do
+        #Check if md5sums file exists for the package
+        if [ -f "/var/lib/dpkg/info/${pkg}.md5sums" ]; then
+            #Read md5sums file for eack package
+            while read -r md5 file; do
+                filepath="/${file}"
+                #Process only files within /sbin and /usr/sbin
+                if [[ "$filepath" == /sbin/* || "$filepath" == /usr/sbin/* ]]; then
+                    if [ -f "$filepath" ]; then
+                        #Calculate hash and compare
+                        md5_hash=$(md5sum "$filepath" | cut -d " " -f1 )
+                        if [ "$md5" == "$md5_hash" ]; then  
+                            echo "OK: $filepath" >> "$WORKINGDIRECTORY/binfailure"
+                        else
+                            echo "MISMATCH: $filepath" >> "$WORKINGDIRECTORY/binfailure"
+                        fi
+                    else   
+                        echo "MISSING: $filepath" >> "$WORKINGDIRECTORY/binfailure"
+                    fi
+                fi
+            done < "/var/lib/dpkg/info/${pkg}.md5sums"
+        else
+            echo "No md5sums file for package: $pkg" >> "$WORKINGDIRECTORY/binfailure"
+        fi
+    done
+    
+    #Checks for files created less that 48 hours ago
+    echo "Files Created in /var/www in the Last 48 Hours:" > "$WORKINGDIRECTORY/recentfiles"
+    find /var/www -type f -ctime -2 >> "$WORKINGDIRECTORY/recentfiles"
+
+    #List any SUID/GUID files
+    echo "SUID/GUID Files in /var/www:" > "$WORKINGDIRECTORY/suidguidfiles"
+    find /var/www -perm /6000 >> "$WORKINGDIRECTORY/suidguidfiles"
+
+    #Remove executable bit from /var/www/images and /var/www/uploads
+    for dir in /var/www/images /var/www/uploads; do
+        if [ -x "$dir" ]; then
+            chmod -x "$dir"
+            echo "Warning: Removed execute permissions from $dir"
+        fi
+    done
+}
+
+
+#Merge files into report, gpg sign, copy over ssh and formatted
+Submit() {
+    myhostname=$(hostname)
+    submission_temp="submission"
+    submission_path="${myhostname}/$(date +%Y)/$(date +%m)"
+    submission_tgz="${submission_path}/${myhostname}-tth-$YMD.tgz"
+    submission_gpg="${submission_tgz}.gpg"
+    submission_sum="${submission_path}/checksum.sha256"
+    submission_id="/opt/security/${IDENTITY}.id"
+    submission_remote_path="/submission"
+    remote_host="$IDENTITY@$REMOTE_SERVER"
+
+    #Make directory structure for submission files
+    mkdir -p "${WORKINGDIRECTORY}/${submission_temp}/${submission_path}"   
+    cd "${WORKINGDIRECTORY}/${submission_temp}"
+
+    #Concatenate report files into the reportfile
+    echo "=== Listening Ports ===" > "$REPORT_FILE"
+    cat "$WORKINGDIRECTORY/listeningports" >> "$REPORT_FILE"
+    echo -e "\n=== Firewall Rules ===" >> "$REPORT_FILE"
+    cat "$WORKINGDIRECTORY/firewall" >> "$REPORT_FILE"
+    echo -e "\n=== Validation Results for /sbin and /usr/sbin ===" >> "$REPORT_FILE"
+    cat "$WORKINGDIRECTORY/binfailure" >> "$REPORT_FILE"
+    echo -e "\n=== Recently Created Files in /var/www ===" >> "$REPORT_FILE"
+    cat "$WORKINGDIRECTORY/recentfiles" >> "$REPORT_FILE"
+    echo -e "\n=== SUID/GID Files in /var/www ===" >> "$REPORT_FILE"
+    cat "$WORKINGDIRECTORY/suidguidfiles" >> "$REPORT_FILE"
+    echo "TTH IoC Check $(hostname) $(Timestamp) OK" | tee -a "$REPORT_FILE"
+
+    #Create archive of the report and related files
+    tar zcf $submission_tgz  "$REPORT_FILE" "$WORKINGDIRECTORY/listeningports" "$WORKINGDIRECTORY/firewall" "$WORKINGDIRECTORY/binfailure" "$WORKINGDIRECTORY/recentfiles" "$WORKINGDIRECTORY/suidguidfiles" 2>/dev/null
+
+    #Make sha256hash for main submission file
+    $VALIDATE_BIN $submission_tgz > $submission_sum
+    
+    #Make gpg signature for the mail submission file
+    gpg --detach-sign -o "${submission_tgz}.gpg"  "$submission_tgz"
+
+    #Rsync submission file structure to the upload server
+    rsync -av -e "ssh -i ${submission_id}" $myhostname $remote_host:$submission_remote_path > /dev/null 2>&1
+
+    #Validate backup
+    remote_file="${submission_remote_path}/${submission_tgz}"
+    remote_size=$(ssh -i "$submission_id" "$remote_host" "stat -c%s \"$remote_file\" | awk '{ printf \"%.2f\n\", \$1 / (1024 * 1024) }'")
+
+    echo "Report uploaded to $remote_file (size: ${remote_size} MB)"
+
+    #Verify GPG signature on remote server
+    remote_file_gpg="${submission_remote_path}/${submission_gpg}"
+    remote_verification_output=$(ssh -i "$submission_id" "$remote_host" "gpg --verify \"$remote_file_gpg\" \"$remote_file\" 2>&1")
+
+    #Check if verification was successful
+    if echo "$remote_verification_output" | grep -q "Good signature"; then
+        echo "GPG signature verification on remote server: SUCCESS"
+    else
+        echo "GPG signature verification on remote server: FAILURE"
+        echo "$remote_verification_output"
+    fi
+
+    #WARNING: Cleanup
+    # previous code: rm -r /opt/security/working/*
+    if [[ "$WORKINGDIRECTORY" == "opt/security/working" ]]; then
+        rm -rf "$WORKINGDIRECTORY"/*
+    else
+        echo "Refusing to clean unexpected directory: $WORKINGDIRECTORY"
+    fi
+
+
+}
+
+
+#Final completion message
+CompletionMsg() {
+    if [ "$BAILOUT" == "false" ]
+    then
+        echo "TTH IoC Check $(hostname) $(Timestamp) OK" 
+    else    
+        echo "FAILED-$(hostname) $(Timestamp)"
+    fi
+}
+
+
+CheckWritable
+CheckProtocol $FILE_URL
+DownloadIOCFile
+DownloadGPGsignature
+IntegrityCheck
+BAILOUTCheck
+ReadIOCs
+IOCcheck
+SystemChecks
+Submit
+CompletionMsg
